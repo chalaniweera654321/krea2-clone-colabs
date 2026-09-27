@@ -22,7 +22,6 @@ import gradio as gr
 from huggingface_hub import hf_hub_download
 from PIL import Image
 from pathlib import Path
-from google.colab import userdata
 
 # ============================================================================
 # COLAB STORAGE / OUTPUT + MEGA CONFIGURATION
@@ -47,8 +46,8 @@ _MEGA_UPLOAD_LOCK = threading.Lock()
 
 def _mega_login():
     """Log in to MEGA once at application startup and fail early if invalid."""
-    email = userdata.get("MEGA_EMAIL")
-    password = userdata.get("MEGA_PASSWORD")
+    email = os.environ.get("MEGA_EMAIL")
+    password = os.environ.get("MEGA_PASSWORD")
 
     if not email or not password:
         raise RuntimeError(
