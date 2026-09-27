@@ -25,105 +25,12 @@ from pathlib import Path
 
 
 # ============================================================================
-# MEGA UPLOAD
+# COLAB STORAGE / OUTPUT CONFIGURATION
 # ============================================================================
 
-_MEGA_UPLOAD_LOCK = threading.Lock()
-
-
-def _mega_login():
-    """Log in to MEGA once at application startup and fail early if invalid."""
-    email = os.environ.get("MEGA_EMAIL")
-    password = os.environ.get("MEGA_PASSWORD")
-
-    if not email or not password:
-        raise RuntimeError(
-            "Missing MEGA_EMAIL or MEGA_PASSWORD in Spaces secrets. "
-            "Set MEGA_EMAIL and MEGA_PASSWORD before starting the app."
-        )
-
-    try:
-        from mega import Mega
-    except ImportError as exc:
-        raise RuntimeError(
-            "The MEGA package is missing. Add mega.py-v2 to requirements.txt."
-        ) from exc
-
-    try:
-        account = Mega().login(email, password)
-        # Force a real authenticated request so invalid credentials are
-        # detected before ComfyUI setup and before the Gradio UI is created.
-        account.get_files()
-    except Exception as exc:
-        raise RuntimeError(
-            "MEGA login verification failed. Check MEGA_EMAIL, "
-            "MEGA_PASSWORD, and the installed MEGA package."
-        ) from exc
-
-    print("[mega] login verification successful", flush=True)
-    return account
-
-
-def _mega_remote_filenames(account) -> set[str]:
-    """Return all filenames currently visible in the MEGA account."""
-    files = account.get_files() or {}
-    names: set[str] = set()
-
-    for node in files.values():
-        if not isinstance(node, dict):
-            continue
-        attrs = node.get("a", {})
-        if isinstance(attrs, dict):
-            name = attrs.get("n")
-            if isinstance(name, str) and name:
-                names.add(name)
-
-    return names
-
-
-def _unique_mega_filename(existing_names: set[str], extension: str = ".png") -> str:
-    """Create the requested timestamp filename and avoid collisions."""
-    timestamp = datetime.now().strftime("Image %b %d, %Y, %I_%M_%S %p")
-    base = f"{timestamp}{extension}"
-
-    if base not in existing_names:
-        return base
-
-    counter = 1
-    while True:
-        candidate = f"{timestamp}_{counter:03d}{extension}"
-        if candidate not in existing_names:
-            return candidate
-        counter += 1
-
-
-def _upload_to_mega(file_path: str, account) -> str:
-    """Upload a generated image to MEGA with a collision-safe filename."""
-    path = pathlib.Path(file_path)
-    if not path.is_file():
-        raise FileNotFoundError(f"Generated file does not exist: {file_path}")
-
-    with _MEGA_UPLOAD_LOCK:
-        existing_names = _mega_remote_filenames(account)
-        filename = _unique_mega_filename(
-            existing_names,
-            extension=path.suffix or ".png",
-        )
-
-        # mega.py supports dest_filename for naming the uploaded remote file.
-        uploaded = account.upload(
-            str(path),
-            dest=None,
-            dest_filename=filename,
-        )
-
-        print(f"[mega] uploaded: {filename}", flush=True)
-        return str(uploaded)
-
-
-# Verify MEGA before any ComfyUI setup, model scanning, or UI creation.
-MEGA_ACCOUNT = _mega_login()
-
+# This version is adapted for Google Colab. Models and LoRAs are stored
+# directly in Colab persistent runtime storage under /content/krea2-models.
+# No MEGA account or MEGA package is required.
 
 # ============================================================================
 # SPACES COMPATIBILITY
@@ -201,7 +108,7 @@ def _detect_comfy_root() -> pathlib.Path:
 
 COMFY = _detect_comfy_root()
 
-MODELS = Path("/mnt/krea2-models")
+MODELS = Path(os.environ.get("KREA_MODELS_DIR", "/content/krea2-models"))
 
 import folder_paths
 
@@ -2597,19 +2504,29 @@ def generate(
                 str(destination)
             )
 
-        # Upload the final metadata-preserving images to MEGA.
-        mega_results: list[str] = []
+        # Keep the generated metadata-preserving images in Colab storage.
+        # The temporary directory is inside the Colab runtime and is returned
+        # directly to the Gradio gallery; no external upload is performed.
+        print(
+            f"[output] generated {len(output_paths)} image(s)",
+            flush=True,
+        )
         for output_path in output_paths:
-            mega_results.append(_upload_to_mega(output_path, account=MEGA_ACCOUNT))
+            print(
+                "[output] ",
+                output_path,
+                flush=True,
+            )
 
-        print(f"[mega] uploaded {len(mega_results)} image(s)", flush=True)
-        print(f"⏱️ Total: "f"{time.time() - total_start:.1f}s")
+        print(
+            f"⏱️ Total: {time.time() - total_start:.1f}s",
+            flush=True,
+        )
         return (
             output_paths,
             (
                 f"done — "
-                f"{len(output_paths)} image(s), "
-                f"uploaded to MEGA folder '{os.environ.get('MEGA_FOLDER', 'Krea2-Outputs')}' — "
+                f"{len(output_paths)} image(s) generated — "
                 f"seed {effective_seed}"
             ),
             effective_seed,
