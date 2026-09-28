@@ -22,7 +22,93 @@ from pathlib import Path
 from typing import Any
 
 from huggingface_hub import hf_hub_download
-from PIL import Image
+
+# ============================================================================
+# PILLOW COMPATIBILITY
+# ============================================================================
+
+# Colab environments can end up with a mixed Pillow installation where
+# ImageText.py comes from one Pillow version and PIL._typing.py comes from
+# another. That produces:
+#   ImportError: cannot import name '_Ink' from 'PIL._typing'
+#
+# ComfyUI is imported only AFTER this repair has completed.
+_PILLOW_TARGET = "11.3.0"
+_PILLOW_REPAIRED = False
+
+
+def _purge_pil_modules() -> None:
+    for name in list(sys.modules):
+        if name == "PIL" or name.startswith("PIL."):
+            sys.modules.pop(name, None)
+
+
+def _ensure_pillow_compatible() -> None:
+    global _PILLOW_REPAIRED
+    if _PILLOW_REPAIRED:
+        return
+
+    from importlib import metadata as importlib_metadata
+
+    installed = None
+    try:
+        installed = importlib_metadata.version("Pillow")
+    except importlib_metadata.PackageNotFoundError:
+        pass
+
+    log("[pillow] installed=%s target=%s", installed, _PILLOW_TARGET)
+
+    # Always use a known-good Pillow release for this runtime. This also fixes
+    # a partially mixed installation left behind by a previous pip install.
+    if installed != _PILLOW_TARGET:
+        log("[pillow] installing Pillow==%s", _PILLOW_TARGET)
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--force-reinstall",
+                "--no-cache-dir",
+                f"Pillow=={_PILLOW_TARGET}",
+            ],
+            check=True,
+        )
+
+    # The notebook may already have imported PIL before preload(). Remove all
+    # old PIL modules so the process cannot mix old/new Python modules.
+    _purge_pil_modules()
+
+    # Verify ImageText and ImageFont in a clean module state.
+    try:
+        from PIL import Image, ImageText, ImageFont  # noqa: F401
+        log("[pillow] verified Pillow %s", getattr(Image, "__version__", installed))
+    except Exception:
+        log("[pillow] verification failed; forcing a clean reinstall")
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--force-reinstall",
+                "--no-cache-dir",
+                f"Pillow=={_PILLOW_TARGET}",
+            ],
+            check=True,
+        )
+        _purge_pil_modules()
+        from PIL import Image, ImageText, ImageFont  # noqa: F401
+        log("[pillow] clean reinstall verified")
+
+    _PILLOW_REPAIRED = True
+
+
+def _pil_image():
+    # Import only after _ensure_pillow_compatible() has run.
+    from PIL import Image
+    return Image
+
 
 # ============================================================================
 # LOGGING
@@ -216,6 +302,7 @@ _COMFY_READY = False
 _NODES_READY = False
 
 _COMFY_LOOP: asyncio.AbstractEventLoop | None = None
+_COMFY_LOOP_THREAD: threading.Thread | None = None
 _COMFY_SERVER = None
 _COMFY_EXECUTOR = None
 _COMFY_RUNTIME_LOCK = threading.RLock()
@@ -474,11 +561,56 @@ def _ensure_comfy() -> None:
         _COMFY_READY = True
         log("[comfy] base setup ready")
 
+def _start_comfy_event_loop() -> asyncio.AbstractEventLoop:
+    """Start one background asyncio loop that lives for the whole notebook."""
+    global _COMFY_LOOP, _COMFY_LOOP_THREAD
+
+    if _COMFY_LOOP is not None and _COMFY_LOOP.is_running():
+        return _COMFY_LOOP
+
+    loop = asyncio.new_event_loop()
+    ready = threading.Event()
+
+    def worker() -> None:
+        asyncio.set_event_loop(loop)
+        ready.set()
+        log("[comfy-loop] background asyncio loop started")
+        loop.run_forever()
+
+    thread = threading.Thread(
+        target=worker,
+        name="krea2-comfy-asyncio",
+        daemon=True,
+    )
+    thread.start()
+    ready.wait(timeout=10)
+
+    if not ready.is_set():
+        raise RuntimeError("ComfyUI asyncio loop failed to start")
+
+    _COMFY_LOOP = loop
+    _COMFY_LOOP_THREAD = thread
+    return loop
+
+
+def _run_comfy_coroutine(coro):
+    """Run a coroutine on the persistent ComfyUI loop.
+
+    This deliberately never calls run_until_complete() on the notebook's
+    asyncio loop. Colab/IPython already has a running event loop, which was
+    the direct cause of the RuntimeError you reported.
+    """
+    loop = _start_comfy_event_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result()
+
+
 def _init_comfy_nodes() -> None:
     global _NODES_READY, _COMFY_LOOP, _COMFY_SERVER, _COMFY_EXECUTOR
 
     with _COMFY_RUNTIME_LOCK:
-        if _NODES_READY:
+        if _NODES_READY and _COMFY_EXECUTOR is not None:
+            log("[comfy-runtime] already initialized; reusing persistent executor")
             return
 
         comfy_path = str(COMFY)
@@ -487,7 +619,7 @@ def _init_comfy_nodes() -> None:
 
         for name in list(sys.modules):
             if name == "utils" or name.startswith("utils."):
-                del sys.modules[name]
+                sys.modules.pop(name, None)
 
         os.chdir(COMFY)
 
@@ -497,28 +629,28 @@ def _init_comfy_nodes() -> None:
         import server
         from app.assets.manager import default_asset_manager
 
-        # IMPORTANT:
-        # One event loop + one PromptServer + one executor for the lifetime
-        # of this Python process. Do not recreate them on every Generate click.
-        _COMFY_LOOP = asyncio.new_event_loop()
-        asyncio.set_event_loop(_COMFY_LOOP)
+        # IMPORTANT: never use asyncio.run() or loop.run_until_complete() here.
+        # Those APIs conflict with IPython/Colab's already-running event loop.
+        loop = _start_comfy_event_loop()
+        _COMFY_LOOP = loop
 
         _COMFY_SERVER = server.PromptServer(
-            _COMFY_LOOP,
+            loop,
             default_asset_manager(),
         )
 
         log("[comfy-runtime] initializing extra nodes")
-        _COMFY_LOOP.run_until_complete(nodes.init_extra_nodes())
+        _run_comfy_coroutine(nodes.init_extra_nodes())
 
-        # Conservative cache for a 12-13 GB RAM Colab runtime.
+        # One PromptExecutor is kept for the lifetime of the notebook kernel.
+        # That allows ComfyUI's model cache to be reused between generations.
         _COMFY_EXECUTOR = execution.PromptExecutor(
             _COMFY_SERVER,
             cache_type=execution.CacheType.RAM_PRESSURE,
             cache_args={
-                "lru": 0,
-                "ram": 0.5,
-                "ram_inactive": 2.0,
+                "lru": 1,
+                "ram": 1.0,
+                "ram_inactive": 4.0,
             },
         )
 
@@ -720,6 +852,7 @@ def _inject_lora_chain(
 # ============================================================================
 
 def _prepare_edit_image(path: str, target_megapixels: float) -> tuple[str, int, int]:
+    Image = _pil_image()
     with Image.open(path) as source:
         image = source.convert("RGB")
 
@@ -737,6 +870,7 @@ def _prepare_edit_image(path: str, target_megapixels: float) -> tuple[str, int, 
     return name, width, height
 
 def _stage_image(path: str, prefix: str) -> str:
+    Image = _pil_image()
     with Image.open(path) as source:
         image = source.convert("RGB")
     name = f"{prefix}_{uuid.uuid4().hex[:12]}.png"
@@ -1030,6 +1164,8 @@ def run_cell_generation() -> tuple[list[str], int]:
         # IMPORTANT: this only checks/uses the already initialized runtime.
         # _init_comfy_nodes() is idempotent and will not create another executor.
         log("[generate] stage 2: validate runtime")
+        if not _NODES_READY or _COMFY_EXECUTOR is None:
+            raise RuntimeError("Persistent Krea runtime is not loaded. Run app_v2.preload() once first.")
         _ensure_comfy()
         _scan_local_models()
         _validate_required_assets()
@@ -1205,6 +1341,20 @@ def run_cell_generation() -> tuple[list[str], int]:
 
 
 # ============================================================================
+# NOTEBOOK MODEL / LORA DISCOVERY
+# ============================================================================
+
+def list_models_and_loras() -> dict[str, list[str]]:
+    """Scan the mounted model volume without initializing ComfyUI."""
+    _ensure_model_directories()
+    _scan_local_models()
+    return {
+        "base_models": list(LOCAL_BASE_MODELS),
+        "loras": list(LOCAL_LORAS),
+    }
+
+
+# ============================================================================
 # NOTEBOOK / PERSISTENT RUNTIME API
 # ============================================================================
 
@@ -1247,6 +1397,7 @@ def _display_generated_image(path: str) -> None:
     """Display an image when app_v2 is imported in a notebook."""
     try:
         from IPython.display import display
+        Image = _pil_image()
         with Image.open(path) as image:
             display(image.copy())
     except Exception as exc:
@@ -1262,6 +1413,23 @@ def preload() -> dict[str, Any]:
     global MEGA_ACCOUNT
 
     with _COMFY_RUNTIME_LOCK:
+        # Repair/normalize Pillow before ComfyUI imports ImageText. This is
+        # intentionally done once per Python process.
+        _ensure_pillow_compatible()
+
+        # settings_utils may have been imported before the Pillow repair.
+        # Reload it so its PIL references point at the repaired installation.
+        try:
+            import importlib
+            import settings_utils as _settings_utils
+            _settings_utils = importlib.reload(_settings_utils)
+            globals()["build_settings"] = _settings_utils.build_settings
+            globals()["extract_image_settings"] = _settings_utils.extract_image_settings
+            globals()["parse_settings_text"] = _settings_utils.parse_settings_text
+            globals()["write_png_metadata"] = _settings_utils.write_png_metadata
+        except Exception as exc:
+            log("[settings] reload warning: %s: %s", type(exc).__name__, exc)
+
         if MEGA_ACCOUNT is None:
             log("[preload] logging into MEGA")
             MEGA_ACCOUNT = _mega_login()
@@ -1296,6 +1464,7 @@ def preload() -> dict[str, Any]:
             "models": list(LOCAL_BASE_MODELS),
             "loras": list(LOCAL_LORAS),
             "ready": bool(_NODES_READY and _COMFY_EXECUTOR is not None),
+            "comfy_loop_running": bool(_COMFY_LOOP is not None and _COMFY_LOOP.is_running()),
         }
 
 
@@ -1352,7 +1521,19 @@ def generate_once(config: dict[str, Any] | None = None) -> tuple[list[str], int]
         log("[generate] runtime not ready; preloading now")
         preload()
 
-    return run_cell_generation()
+    output_paths, used_seed = run_cell_generation()
+
+    # In Colab/Jupyter, automatically render the generated image(s) in the
+    # output of the generation cell. No manual open/display step is needed.
+    for output_path in output_paths:
+        _display_generated_image(output_path)
+
+    return output_paths, used_seed
+
+
+def generate(config: dict[str, Any] | None = None) -> tuple[list[str], int]:
+    """Public notebook API: generate using the already-preloaded runtime."""
+    return generate_once(config)
 
 
 def runtime_status() -> dict[str, Any]:
