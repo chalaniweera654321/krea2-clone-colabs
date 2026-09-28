@@ -1393,17 +1393,6 @@ DEFAULT_CONFIG = {
 }
 
 
-def _display_generated_image(path: str) -> None:
-    """Display an image when app_v2 is imported in a notebook."""
-    try:
-        from IPython.display import display
-        Image = _pil_image()
-        with Image.open(path) as image:
-            display(image.copy())
-    except Exception as exc:
-        log_exception("image-display", exc)
-        print(f"Generated image: {path}", flush=True)
-
 
 def preload() -> dict[str, Any]:
     """Initialize ComfyUI/MEGA once and keep the runtime alive.
@@ -1523,11 +1512,6 @@ def generate_once(config: dict[str, Any] | None = None) -> tuple[list[str], int]
 
     output_paths, used_seed = run_cell_generation()
 
-    # In Colab/Jupyter, automatically render the generated image(s) in the
-    # output of the generation cell. No manual open/display step is needed.
-    for output_path in output_paths:
-        _display_generated_image(output_path)
-
     return output_paths, used_seed
 
 
@@ -1561,7 +1545,6 @@ if __name__ == "__main__":
         log("[main] generation successful; seed=%s", used_seed)
         for output in outputs:
             log("[main] output=%s", output)
-            _display_generated_image(output)
     except BaseException as exc:
         log_exception("main", exc)
         _cleanup_memory("application-failure")
