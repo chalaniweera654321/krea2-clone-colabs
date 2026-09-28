@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
+import faulthandler
+import logging
+import signal
 import glob
 import json
 import os
@@ -23,20 +27,86 @@ from huggingface_hub import hf_hub_download
 from PIL import Image
 from pathlib import Path
 
+
 # ============================================================================
-# COLAB STORAGE / OUTPUT + MEGA CONFIGURATION
+# COLAB DEBUG / CRASH LOGGING
 # ============================================================================
 
-# Google Colab model/LoRA storage:
-#   /content/krea2-models
-#
-# Generated images are also uploaded to MEGA, preserving the original
-# application's MEGA save feature. Set these environment variables before
-# launching the app:
-#   MEGA_EMAIL
-#   MEGA_PASSWORD
-#   MEGA_FOLDER (optional; kept for the status message, as in the original app)
-#
+DEBUG_LOG = pathlib.Path(os.environ.get("KREA_DEBUG_LOG", "/content/krea2_debug.log"))
+try:
+    DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+    _debug_stream = open(DEBUG_LOG, "a", encoding="utf-8", buffering=1)
+except Exception:
+    _debug_stream = None
+
+try:
+    faulthandler.enable(_debug_stream or sys.stderr)
+except Exception:
+    pass
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(DEBUG_LOG, encoding="utf-8")],
+    force=True,
+)
+LOGGER = logging.getLogger("krea2")
+
+def _log(message: str, level: int = logging.INFO) -> None:
+    try:
+        LOGGER.log(level, message)
+    except Exception:
+        print(message, flush=True)
+
+def _log_exception(context: str, exc: BaseException) -> None:
+    _log(f"[ERROR] {context}: {type(exc).__name__}: {exc}", logging.ERROR)
+    LOGGER.error("\n%s", traceback.format_exc())
+
+def _uncaught_exception(exc_type, exc_value, exc_tb):
+    LOGGER.critical("[CRASH] Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+def _thread_exception(args):
+    LOGGER.critical("[CRASH] Uncaught thread exception in %s", getattr(args.thread, "name", "unknown"), exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+sys.excepthook = _uncaught_exception
+if hasattr(threading, "excepthook"):
+    threading.excepthook = _thread_exception
+
+def _log_system_state(tag: str = "state") -> None:
+    _log(f"[system] ===== {tag} =====")
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        _log(f"[system] RAM: {vm.percent:.1f}% used | {vm.used / 1024**3:.2f} / {vm.total / 1024**3:.2f} GB")
+    except Exception as exc:
+        _log(f"[system] RAM unavailable: {exc}", logging.WARNING)
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10, check=False)
+        if r.returncode == 0:
+            for line in r.stdout.strip().splitlines():
+                _log(f"[system] GPU: {line}")
+        else:
+            _log(f"[system] nvidia-smi failed: {r.stderr.strip()}", logging.WARNING)
+    except Exception as exc:
+        _log(f"[system] GPU state unavailable: {exc}", logging.WARNING)
+
+def _signal_handler(signum, _frame):
+    _log(f"[SIGNAL] received signal {signum}", logging.WARNING)
+    _log_system_state("signal")
+
+for _sig_name in ("SIGTERM", "SIGINT"):
+    _sig = getattr(signal, _sig_name, None)
+    if _sig is not None:
+        try:
+            signal.signal(_sig, _signal_handler)
+        except Exception:
+            pass
+
+_log(f"[debug] log file: {DEBUG_LOG}")
+_log_system_state("startup-import")
+
+
 # ============================================================================
 # MEGA UPLOAD
 # ============================================================================
@@ -45,37 +115,22 @@ _MEGA_UPLOAD_LOCK = threading.Lock()
 
 
 def _mega_login():
-    """Log in to MEGA once at application startup and fail early if invalid."""
-    email = os.environ.get("MEGA_EMAIL")
-    password = os.environ.get("MEGA_PASSWORD")
-
+    """Best-effort MEGA login; MEGA failure must not stop image generation."""
+    email=os.environ.get("MEGA_EMAIL", "").strip(); password=os.environ.get("MEGA_PASSWORD", "")
     if not email or not password:
-        raise RuntimeError(
-            "Missing MEGA_EMAIL or MEGA_PASSWORD. "
-            "Set them in the Colab environment before starting the app."
-        )
-
+        _log("[mega] credentials not set; uploads disabled for this session", logging.WARNING)
+        return None
     try:
         from mega import Mega
-    except ImportError as exc:
-        raise RuntimeError(
-            "The MEGA package is missing. Run: "
-            "!pip install -q mega.py-v2"
-        ) from exc
-
-    try:
-        account = Mega().login(email, password)
-        # Force an authenticated request so bad credentials are detected
-        # before ComfyUI setup and before the Gradio UI is created.
+        _log("[mega] logging in...")
+        account=Mega().login(email,password)
         account.get_files()
+        _log("[mega] login verification successful")
+        return account
     except Exception as exc:
-        raise RuntimeError(
-            "MEGA login verification failed. Check MEGA_EMAIL, "
-            "MEGA_PASSWORD, and the installed MEGA package."
-        ) from exc
-
-    print("[mega] login verification successful", flush=True)
-    return account
+        _log_exception("MEGA login verification failed", exc)
+        _log("[mega] uploads disabled; generation will continue", logging.WARNING)
+        return None
 
 
 def _mega_remote_filenames(account) -> set[str]:
@@ -95,14 +150,9 @@ def _mega_remote_filenames(account) -> set[str]:
     return names
 
 
-def _unique_mega_filename(
-    existing_names: set[str],
-    extension: str = ".png",
-) -> str:
-    """Create timestamp filename and avoid collisions."""
-    timestamp = datetime.now().strftime(
-        "Image %b %d, %Y, %I_%M_%S %p"
-    )
+def _unique_mega_filename(existing_names: set[str], extension: str = ".png") -> str:
+    """Create the requested timestamp filename and avoid collisions."""
+    timestamp = datetime.now().strftime("Image %b %d, %Y, %I_%M_%S %p")
     base = f"{timestamp}{extension}"
 
     if base not in existing_names:
@@ -110,46 +160,37 @@ def _unique_mega_filename(
 
     counter = 1
     while True:
-        candidate = (
-            f"{timestamp}_{counter:03d}{extension}"
-        )
+        candidate = f"{timestamp}_{counter:03d}{extension}"
         if candidate not in existing_names:
             return candidate
         counter += 1
 
 
 def _upload_to_mega(file_path: str, account) -> str:
-    """Upload generated image to MEGA with a collision-safe filename."""
+    """Upload a generated image to MEGA with a collision-safe filename."""
     path = pathlib.Path(file_path)
-
     if not path.is_file():
-        raise FileNotFoundError(
-            f"Generated file does not exist: {file_path}"
-        )
+        raise FileNotFoundError(f"Generated file does not exist: {file_path}")
 
     with _MEGA_UPLOAD_LOCK:
         existing_names = _mega_remote_filenames(account)
-
         filename = _unique_mega_filename(
             existing_names,
             extension=path.suffix or ".png",
         )
 
+        # mega.py supports dest_filename for naming the uploaded remote file.
         uploaded = account.upload(
             str(path),
             dest=None,
             dest_filename=filename,
         )
 
-        print(
-            f"[mega] uploaded: {filename}",
-            flush=True,
-        )
-
+        print(f"[mega] uploaded: {filename}", flush=True)
         return str(uploaded)
 
 
-# Verify MEGA before ComfyUI setup and UI creation.
+# Verify MEGA before any ComfyUI setup, model scanning, or UI creation.
 MEGA_ACCOUNT = _mega_login()
 
 
@@ -231,7 +272,14 @@ COMFY = _detect_comfy_root()
 
 MODELS = Path(os.environ.get("KREA_MODELS_DIR", "/content/krea2-models"))
 
-import folder_paths
+if str(COMFY) not in sys.path:
+    sys.path.insert(0, str(COMFY))
+
+try:
+    import folder_paths
+except Exception as exc:
+    _log_exception("import folder_paths", exc)
+    raise
 
 folder_paths.add_model_folder_path(
     "diffusion_models",
@@ -436,23 +484,17 @@ _workflow_cache: dict[str, dict[str, Any]] = {}
 # COMMAND HELPERS
 # ============================================================================
 
-def _run(
-    command: list[str],
-    cwd: pathlib.Path | None = None,
-    check: bool = True,
-) -> None:
-
-    print(
-        "[setup]",
-        " ".join(command),
-        flush=True,
-    )
-
-    subprocess.run(
-        command,
-        cwd=str(cwd) if cwd else None,
-        check=check,
-    )
+def _run(command: list[str], cwd: pathlib.Path | None = None, check: bool = True) -> None:
+    _log("[setup] RUN: " + " ".join(map(str, command)))
+    if cwd: _log(f"[setup] CWD: {cwd}")
+    try:
+        process=subprocess.Popen([str(x) for x in command], cwd=str(cwd) if cwd else None, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        assert process.stdout is not None
+        for line in process.stdout: print(f"[cmd] {line.rstrip()}", flush=True)
+        code=process.wait(); _log(f"[setup] EXIT CODE: {code}")
+        if check and code != 0: raise subprocess.CalledProcessError(code, command)
+    except Exception as exc:
+        _log_exception("command failed: " + " ".join(map(str, command)), exc); raise
 
 
 def _pip_install(
@@ -468,7 +510,7 @@ def _pip_install(
             "--no-cache-dir",
             *arguments,
         ],
-        check=False,
+        check=True,
     )
 
 
@@ -513,7 +555,10 @@ def _install_filtered_requirements(
             requirements.append(item)
 
     if requirements:
+        _log(f"[requirements] installing {len(requirements)} package(s)")
         _pip_install(requirements)
+    else:
+        _log("[requirements] nothing to install")
 
 
 def _ensure_repo(
@@ -878,11 +923,8 @@ def _ensure_comfy() -> None:
         return
 
 
-    print(
-        "[comfy] using:",
-        COMFY,
-        flush=True,
-    )
+    _log(f"[comfy] using: {COMFY}")
+    _log_system_state("before-comfy-setup")
 
 
     if not (
@@ -899,19 +941,16 @@ def _ensure_comfy() -> None:
     # Requirements
     # ------------------------------------------------------------------------
 
-    _install_filtered_requirements(
-        COMFY / "requirements.txt"
-    )
+    _log("[comfy] stage 1/6: requirements")
+    _install_filtered_requirements(COMFY / "requirements.txt")
 
 
     # ------------------------------------------------------------------------
     # Custom nodes
     # ------------------------------------------------------------------------
 
-    CUSTOM_NODES.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    _log("[comfy] stage 2/6: custom nodes")
+    CUSTOM_NODES.mkdir(parents=True, exist_ok=True)
 
     _ensure_repo(
         CUSTOM_NODES / "comfyui-krea2edit",
@@ -923,6 +962,7 @@ def _ensure_comfy() -> None:
     # Compatibility
     # ------------------------------------------------------------------------
 
+    _log("[comfy] stage 3/6: compatibility")
     _restore_utils_namespace()
 
 
@@ -930,6 +970,7 @@ def _ensure_comfy() -> None:
     # Directories
     # ------------------------------------------------------------------------
 
+    _log("[comfy] stage 4/6: model directories")
     _ensure_model_directories()
 
 
@@ -937,6 +978,7 @@ def _ensure_comfy() -> None:
     # Identity adapter only
     # ------------------------------------------------------------------------
 
+    _log("[comfy] stage 5/6: identity adapter")
     _download_identity_model()
 
 
@@ -944,6 +986,7 @@ def _ensure_comfy() -> None:
     # Scan
     # ------------------------------------------------------------------------
 
+    _log("[comfy] stage 6/6: model scan")
     _scan_local_models()
 
 
@@ -992,20 +1035,19 @@ def _init_comfy_nodes() -> None:
     os.chdir(COMFY)
 
 
+    _log("[nodes] importing execution/nodes/server")
     import execution
     import nodes
     import server
-
+    _log("[nodes] importing asset manager")
     from app.assets.manager import default_asset_manager
     loop = asyncio.new_event_loop()
 
     asyncio.set_event_loop(loop)
 
 
-    server_instance = server.PromptServer(
-        loop,
-        default_asset_manager()
-    )
+    _log("[nodes] creating PromptServer")
+    server_instance = server.PromptServer(loop, default_asset_manager())
 
 
     execution.PromptQueue(
@@ -2001,14 +2043,21 @@ def _execute_workflow(
     )
 
 
-    executor.execute(
-        workflow,
-        prompt_id,
-        extra_data={},
-        execute_outputs=[
-            save_id
-        ],
-    )
+    _log(f"[execute] prompt_id={prompt_id}")
+    _log(f"[execute] output node={save_id}")
+    _log("[execute] nodes: " + ", ".join(f"{node_id}:{node.get('class_type','?')}" for node_id,node in workflow.items()))
+    _log_system_state("before-executor")
+    try:
+        executor.execute(workflow,prompt_id,extra_data={},execute_outputs=[save_id])
+    except Exception as exc:
+        _log_exception("ComfyUI executor.execute", exc)
+        try: _log(f"[execute] status_messages={executor.status_messages!r}")
+        except Exception: pass
+        raise
+    _log(f"[execute] executor.success={executor.success}")
+    try: _log(f"[execute] status_messages={executor.status_messages!r}")
+    except Exception: pass
+    _log_system_state("after-executor")
 
 
     if not executor.success:
@@ -2262,6 +2311,17 @@ def get_gpu_duration(
 
 
 # ============================================================================
+# GENERATION HEARTBEAT
+# ============================================================================
+
+def _generation_heartbeat(stop_event: threading.Event, started: float) -> None:
+    while not stop_event.wait(10):
+        elapsed=time.time()-started
+        _log(f"[heartbeat] generation still running: {elapsed:.1f}s")
+        _log_system_state(f"generation-{elapsed:.0f}s")
+
+
+# ============================================================================
 # GENERATE
 # ============================================================================
 
@@ -2317,9 +2377,15 @@ def generate(
     staged: list[pathlib.Path] = []
 
     total_start = time.time()
+    heartbeat_stop=threading.Event()
+    threading.Thread(target=_generation_heartbeat, args=(heartbeat_stop,total_start), name="krea2-heartbeat", daemon=True).start()
+    _log("[generate] ===== START =====")
+    _log(f"[generate] mode={mode} seed={effective_seed} model={base_model}")
+    _log_system_state("generation-start")
 
     try:
 
+        _log("[generate] stage 1: validate request")
         _validate_request(
             mode,
             prompt,
@@ -2349,6 +2415,7 @@ def generate(
             )
 
 
+        _log("[generate] stage 2: prepare runtime")
         resolved_base_model = (
             _prepare_runtime(
                 base_model,
@@ -2408,6 +2475,8 @@ def generate(
                     )
                 )
 
+
+        _log(f"[generate] stage 3: build {mode} workflow")
 
         # --------------------------------------------------------------------
         # T2I
@@ -2486,6 +2555,8 @@ def generate(
             )
 
 
+        _log("[generate] stage 4: inject parameters and LoRAs")
+
         # --------------------------------------------------------------------
         # INJECT
         # --------------------------------------------------------------------
@@ -2531,6 +2602,8 @@ def generate(
                 enabled_loras=enabled_loras,
             )
 
+
+        _log("[generate] stage 5: build metadata")
 
         # --------------------------------------------------------------------
         # METADATA
@@ -2589,9 +2662,9 @@ def generate(
         )
 
 
-        result_paths = _execute_workflow(
-            workflow
-        )
+        _log("[generate] stage 6: execute ComfyUI workflow")
+        result_paths=_execute_workflow(workflow)
+        _log(f"[generate] ComfyUI returned {len(result_paths)} output(s)")
 
 
         destination_dir = pathlib.Path(
@@ -2625,55 +2698,68 @@ def generate(
                 str(destination)
             )
 
-        # Upload the final metadata-preserving images to MEGA.
-        mega_results: list[str] = []
+        _log("[generate] stage 7: upload to MEGA (best effort)")
+        mega_results = []
+        mega_errors = []
 
-        for output_path in output_paths:
-            mega_results.append(
-                _upload_to_mega(
-                    output_path,
-                    account=MEGA_ACCOUNT,
-                )
+        if MEGA_ACCOUNT is None:
+            _log("[mega] skipped: account unavailable", logging.WARNING)
+        else:
+            for output_path in output_paths:
+                try:
+                    mega_results.append(
+                        _upload_to_mega(
+                            output_path,
+                            account=MEGA_ACCOUNT,
+                        )
+                    )
+                except Exception as exc:
+                    mega_errors.append(str(exc))
+                    _log_exception(
+                        f"MEGA upload failed for {output_path}",
+                        exc,
+                    )
+
+        _log(
+            f"[mega] uploaded {len(mega_results)} image(s); "
+            f"failed {len(mega_errors)}"
+        )
+
+        elapsed_total = time.time() - total_start
+        _log(f"[generate] ===== SUCCESS in {elapsed_total:.1f}s =====")
+        _log_system_state("generation-end")
+
+        if mega_errors:
+            mega_status = (
+                f"MEGA upload failed for {len(mega_errors)} image(s); "
+                f"see {DEBUG_LOG}"
             )
-
-        print(
-            f"[mega] uploaded {len(mega_results)} image(s)",
-            flush=True,
-        )
-
-        print(
-            f"⏱️ Total: {time.time() - total_start:.1f}s",
-            flush=True,
-        )
+        elif mega_results:
+            mega_status = (
+                f"uploaded to MEGA folder "
+                f"'{os.environ.get('MEGA_FOLDER', 'Krea2-Outputs')}'"
+            )
+        else:
+            mega_status = "MEGA upload skipped"
 
         return (
             output_paths,
-            (
-                f"done — "
-                f"{len(output_paths)} image(s), "
-                f"uploaded to MEGA folder '"
-                f"{os.environ.get('MEGA_FOLDER', 'Krea2-Outputs')}"
-                f"' — seed {effective_seed}"
-            ),
+            f"done — {len(output_paths)} image(s), "
+            f"{mega_status} — seed {effective_seed}",
             effective_seed,
         )
 
-
     except Exception as exc:
-
-        print(
-            traceback.format_exc(),
-            flush=True,
-        )
-
-
+        _log_exception("generation failed", exc)
+        _log_system_state("generation-error")
+        _log(f"[generate] DEBUG LOG: {DEBUG_LOG}", logging.ERROR)
         raise gr.Error(
-            "generation failed: "
-            + str(exc)[:500]
+            f"generation failed: {type(exc).__name__}: {exc}"[:1000]
         ) from exc
 
-
     finally:
+        heartbeat_stop.set()
+        _log(f"[generate] cleanup: {len(staged)} staged file(s)")
 
         for path in staged:
 
@@ -3259,17 +3345,8 @@ def _on_startup() -> None:
 
 
     except Exception as exc:
-
-        print(
-            "[startup] setup incomplete "
-            f"({type(exc).__name__}: {exc})",
-            flush=True,
-        )
-
-        print(
-            "[startup] generation will retry setup",
-            flush=True,
-        )
+        _log_exception("startup setup incomplete", exc)
+        _log(f"[startup] generation will retry setup; full log: {DEBUG_LOG}", logging.WARNING)
 
 
 # ============================================================================
@@ -3278,7 +3355,11 @@ def _on_startup() -> None:
 
 _on_startup()
 
-_scan_local_models()
+try:
+    _scan_local_models()
+except Exception as exc:
+    _log_exception("final model scan", exc)
+    raise
 
 demo = create_ui()
 
