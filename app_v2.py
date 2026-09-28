@@ -27,12 +27,10 @@ from huggingface_hub import hf_hub_download
 # PILLOW COMPATIBILITY
 # ============================================================================
 
-# Colab environments can end up with a mixed Pillow installation where
-# ImageText.py comes from one Pillow version and PIL._typing.py comes from
-# another. That produces:
-#   ImportError: cannot import name '_Ink' from 'PIL._typing'
-#
-# ComfyUI is imported only AFTER this repair has completed.
+# Colab/Jupyter can retain old PIL modules in sys.modules after pip changes
+# the package on disk.  We only verify the Pillow APIs actually used here.
+# Do NOT import PIL.ImageText: it is not required by this application and can
+# cause false failures with otherwise valid Pillow installations.
 _PILLOW_TARGET = "11.3.0"
 _PILLOW_REPAIRED = False
 
@@ -43,69 +41,67 @@ def _purge_pil_modules() -> None:
             sys.modules.pop(name, None)
 
 
+def _install_pillow() -> None:
+    log("[pillow] installing Pillow==%s", _PILLOW_TARGET)
+    subprocess.run(
+        [
+            sys.executable, "-m", "pip", "install",
+            "--force-reinstall", "--no-cache-dir",
+            f"Pillow=={_PILLOW_TARGET}",
+        ],
+        check=True,
+    )
+
+
+def _verify_pillow() -> None:
+    _purge_pil_modules()
+    from PIL import Image, ImageFont  # noqa: F401
+    version = getattr(Image, "__version__", "unknown")
+    log(
+        "[pillow] verified: Pillow %s | Image=%s | ImageFont=%s",
+        version, Image.__file__, ImageFont.__file__,
+    )
+
+
 def _ensure_pillow_compatible() -> None:
     global _PILLOW_REPAIRED
     if _PILLOW_REPAIRED:
         return
 
     from importlib import metadata as importlib_metadata
-
-    installed = None
     try:
         installed = importlib_metadata.version("Pillow")
     except importlib_metadata.PackageNotFoundError:
-        pass
+        installed = None
 
     log("[pillow] installed=%s target=%s", installed, _PILLOW_TARGET)
 
-    # Always use a known-good Pillow release for this runtime. This also fixes
-    # a partially mixed installation left behind by a previous pip install.
-    if installed != _PILLOW_TARGET:
-        log("[pillow] installing Pillow==%s", _PILLOW_TARGET)
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--force-reinstall",
-                "--no-cache-dir",
-                f"Pillow=={_PILLOW_TARGET}",
-            ],
-            check=True,
-        )
-
-    # The notebook may already have imported PIL before preload(). Remove all
-    # old PIL modules so the process cannot mix old/new Python modules.
-    _purge_pil_modules()
-
-    # Verify ImageText and ImageFont in a clean module state.
+    # First try the current installation. This avoids unnecessary pip work.
     try:
-        from PIL import Image, ImageText, ImageFont  # noqa: F401
-        log("[pillow] verified Pillow %s", getattr(Image, "__version__", installed))
-    except Exception:
-        log("[pillow] verification failed; forcing a clean reinstall")
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--force-reinstall",
-                "--no-cache-dir",
-                f"Pillow=={_PILLOW_TARGET}",
-            ],
-            check=True,
-        )
-        _purge_pil_modules()
-        from PIL import Image, ImageText, ImageFont  # noqa: F401
-        log("[pillow] clean reinstall verified")
+        _verify_pillow()
+        _PILLOW_REPAIRED = True
+        return
+    except Exception as exc:
+        log("[pillow] verification failed: %s", exc)
+
+    # Only reinstall when Pillow is actually broken.
+    _install_pillow()
+    _purge_pil_modules()
+    try:
+        _verify_pillow()
+    except Exception as exc:
+        log_exception("pillow-verification", exc)
+        raise RuntimeError(
+            "Pillow is still broken after reinstall. Restart the Colab runtime "
+            "and run the preload cell again."
+        ) from exc
 
     _PILLOW_REPAIRED = True
+    log("[pillow] clean reinstall verified successfully")
 
 
 def _pil_image():
-    # Import only after _ensure_pillow_compatible() has run.
+    _ensure_pillow_compatible()
     from PIL import Image
     return Image
 
@@ -1167,6 +1163,10 @@ def run_cell_generation() -> tuple[list[str], int]:
         if not _NODES_READY or _COMFY_EXECUTOR is None:
             raise RuntimeError("Persistent Krea runtime is not loaded. Run app_v2.preload() once first.")
         _ensure_comfy()
+        # ComfyUI requirements are filtered to exclude Pillow, but verify once
+        # more after setup so a pre-existing notebook package conflict cannot
+        # leak into ComfyUI imports.
+        _ensure_pillow_compatible()
         _scan_local_models()
         _validate_required_assets()
 
