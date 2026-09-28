@@ -74,22 +74,71 @@ if hasattr(threading, "excepthook"):
     threading.excepthook = _thread_exception
 
 def _log_system_state(tag: str = "state") -> None:
+    """Log detailed CPU RAM, process RAM, GPU VRAM and PyTorch CUDA state."""
     _log(f"[system] ===== {tag} =====")
+
+    # System + current Python process RAM.
     try:
         import psutil
         vm = psutil.virtual_memory()
-        _log(f"[system] RAM: {vm.percent:.1f}% used | {vm.used / 1024**3:.2f} / {vm.total / 1024**3:.2f} GB")
+        available_gb = vm.available / 1024**3
+        used_gb = vm.used / 1024**3
+        total_gb = vm.total / 1024**3
+        _log(
+            f"[system] RAM: {vm.percent:.1f}% used | "
+            f"{used_gb:.2f} / {total_gb:.2f} GB | "
+            f"available: {available_gb:.2f} GB"
+        )
+
+        process = psutil.Process(os.getpid())
+        rss = process.memory_info().rss / 1024**3
+        _log(f"[system] Python process RSS: {rss:.2f} GB")
     except Exception as exc:
-        _log(f"[system] RAM unavailable: {exc}", logging.WARNING)
+        _log(f"[system] RAM unavailable: {type(exc).__name__}: {exc}", logging.WARNING)
+
+    # NVIDIA driver-level memory/utilization.
     try:
-        r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10, check=False)
+        r = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,memory.used,memory.free,memory.total,"utilization.gpu",temperature.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
         if r.returncode == 0:
             for line in r.stdout.strip().splitlines():
                 _log(f"[system] GPU: {line}")
         else:
             _log(f"[system] nvidia-smi failed: {r.stderr.strip()}", logging.WARNING)
     except Exception as exc:
-        _log(f"[system] GPU state unavailable: {exc}", logging.WARNING)
+        _log(f"[system] GPU state unavailable: {type(exc).__name__}: {exc}", logging.WARNING)
+
+    # PyTorch allocator state. This is especially useful for finding CUDA
+    # memory pressure that nvidia-smi alone cannot explain.
+    try:
+        import torch
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            allocated = torch.cuda.memory_allocated(device) / 1024**3
+            reserved = torch.cuda.memory_reserved(device) / 1024**3
+            peak_allocated = torch.cuda.max_memory_allocated(device) / 1024**3
+            peak_reserved = torch.cuda.max_memory_reserved(device) / 1024**3
+            free_torch, total_torch = torch.cuda.mem_get_info(device)
+            free_torch /= 1024**3
+            total_torch /= 1024**3
+            _log(
+                f"[system] PyTorch CUDA: allocated={allocated:.2f} GB | "
+                f"reserved={reserved:.2f} GB | "
+                f"peak_allocated={peak_allocated:.2f} GB | "
+                f"peak_reserved={peak_reserved:.2f} GB | "
+                f"free={free_torch:.2f} / {total_torch:.2f} GB"
+            )
+    except Exception as exc:
+        _log(f"[system] PyTorch CUDA state unavailable: {type(exc).__name__}: {exc}", logging.DEBUG)
 
 def _signal_handler(signum, _frame):
     _log(f"[SIGNAL] received signal {signum}", logging.WARNING)
@@ -2048,7 +2097,10 @@ def _execute_workflow(
     _log("[execute] nodes: " + ", ".join(f"{node_id}:{node.get('class_type','?')}" for node_id,node in workflow.items()))
     _log_system_state("before-executor")
     try:
+        _log("[execute] >>> executor.execute() START")
+        _log_system_state("executor-start")
         executor.execute(workflow,prompt_id,extra_data={},execute_outputs=[save_id])
+        _log("[execute] <<< executor.execute() RETURNED")
     except Exception as exc:
         _log_exception("ComfyUI executor.execute", exc)
         try: _log(f"[execute] status_messages={executor.status_messages!r}")
@@ -2315,8 +2367,9 @@ def get_gpu_duration(
 # ============================================================================
 
 def _generation_heartbeat(stop_event: threading.Event, started: float) -> None:
-    while not stop_event.wait(10):
-        elapsed=time.time()-started
+    """Monitor generation every 2 seconds without touching the executor."""
+    while not stop_event.wait(2):
+        elapsed = time.time() - started
         _log(f"[heartbeat] generation still running: {elapsed:.1f}s")
         _log_system_state(f"generation-{elapsed:.0f}s")
 
