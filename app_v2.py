@@ -303,9 +303,14 @@ def _install_filtered_requirements(path: Path) -> None:
         log("[requirements] not found: %s", path)
         return
 
+    # Do not let app_v2 silently replace packages that the Colab notebook
+    # deliberately installed. In particular, replacing Pillow while the
+    # kernel is alive can leave mixed PIL modules in sys.modules.
     blocked = {
         "torch", "torchvision", "torchaudio",
         "transformers", "huggingface-hub", "accelerate",
+        "pillow",
+        "gradio",
     }
     requirements: list[str] = []
 
@@ -452,6 +457,7 @@ def _ensure_comfy() -> None:
 
     with _COMFY_RUNTIME_LOCK:
         if _COMFY_READY:
+            log("[comfy] base setup already ready; skipping pip/git setup")
             return
 
         log("[comfy] using: %s", COMFY)
@@ -1272,8 +1278,11 @@ def preload() -> dict[str, Any]:
                 f"No diffusion models found in {DIFFUSION_DIR}"
             )
 
-        log("[preload] initializing persistent ComfyUI runtime")
-        _init_comfy_nodes()
+        if _NODES_READY and _COMFY_EXECUTOR is not None:
+            log("[preload] persistent runtime already initialized; reusing it")
+        else:
+            log("[preload] initializing persistent ComfyUI runtime")
+            _init_comfy_nodes()
 
         log("=" * 80)
         log("[preload] READY — runtime will stay loaded in this notebook kernel")
