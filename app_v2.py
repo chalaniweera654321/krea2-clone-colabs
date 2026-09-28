@@ -967,13 +967,10 @@ def _profile_from_values(
     )
 
 # ============================================================================
-# CELL CONFIGURATION
-# ============================================================================
-# Edit these variables, then run:
-#     !python app_v2.py
-# No Gradio is used.
+# GENERATION IMPLEMENTATION
 # ============================================================================
 
+# Standalone-generation settings are overwritten by generate_once().
 MODE = "text2image"
 PROMPT = "A cinematic portrait in soft natural light"
 EDIT_PROMPT = ""
@@ -992,27 +989,14 @@ SCHEDULER = "beta"
 SEED = 2
 RANDOMIZE_SEED = False
 GEN_BUDGET = 0
-BASE_MODEL = "krea2_turbo_fp8_scaled.safetensors"
-LORA_WEIGHTS = {
-    # "Body Hair.safetensors": 0.50,
-    # "Skin Details.safetensors": 0.30,
-}
+BASE_MODEL = ""
+LORA_WEIGHTS: dict[str, float] = {}
 
-def _open_generated_image(path: str) -> None:
-    """Display generated image inline in Google Colab."""
-    log("[image] opening generated image: %s", path)
-    try:
-        from IPython.display import display
-        with Image.open(path) as image:
-            display(image.copy())
-        log("[image] displayed inline")
-    except Exception as exc:
-        log_exception("image-display", exc)
-        print(f"Generated image: {path}", flush=True)
 
 def run_cell_generation() -> tuple[list[str], int]:
     total_start = time.time()
     staged: list[Path] = []
+
     log("=" * 80)
     log("[generate] ===== START =====")
     log("[generate] mode=%s model=%s", MODE, BASE_MODEL)
@@ -1026,28 +1010,44 @@ def run_cell_generation() -> tuple[list[str], int]:
 
     try:
         log("[generate] generation lock acquired")
+
         _validate_request(MODE, PROMPT, EDIT_PROMPT, PRIMARY_IMAGE)
         log("[generate] stage 1: validate request")
+
         effective_edit_prompt = (EDIT_PROMPT or PROMPT or "").strip()
+
         if SAMPLER not in SAMPLERS:
             raise ValueError(f"unsupported sampler: {SAMPLER}")
         if SCHEDULER not in SCHEDULERS:
             raise ValueError(f"unsupported scheduler: {SCHEDULER}")
 
-        log("[generate] stage 2: prepare runtime")
-        resolved_base_model = _prepare_runtime(BASE_MODEL)
+        # IMPORTANT: this only checks/uses the already initialized runtime.
+        # _init_comfy_nodes() is idempotent and will not create another executor.
+        log("[generate] stage 2: validate runtime")
+        _ensure_comfy()
+        _scan_local_models()
+        _validate_required_assets()
+
+        resolved_base_model = _validate_model_name(BASE_MODEL)
+        _init_comfy_nodes()
 
         enabled_loras: list[tuple[str, float]] = []
         for filename, weight in (LORA_WEIGHTS or {}).items():
             if filename not in LOCAL_LORAS:
                 raise ValueError(f"local LoRA is not available: {filename}")
+
             numeric = float(weight)
             if numeric < -3.0 or numeric > 3.0:
                 raise ValueError(f"LoRA weight out of range: {filename}")
+
             if abs(numeric) > 1e-6:
                 enabled_loras.append((_validate_lora_name(filename), numeric))
 
-        effective_seed = random.randint(0, 2**32 - 1) if RANDOMIZE_SEED or int(SEED) < 0 else int(SEED)
+        effective_seed = (
+            random.randint(0, 2**32 - 1)
+            if RANDOMIZE_SEED or int(SEED) < 0
+            else int(SEED)
+        )
 
         if MODE == "text2image":
             width = max(512, min(MAX_WIDTH, int(WIDTH) // 64 * 64))
@@ -1056,54 +1056,103 @@ def run_cell_generation() -> tuple[list[str], int]:
             workflow = _t2i_workflow(resolved_base_model)
         else:
             log("[generate] stage 3: prepare edit image")
-            primary_name, width, height = _prepare_edit_image(PRIMARY_IMAGE, TARGET_MEGAPIXELS)
+            primary_name, width, height = _prepare_edit_image(
+                PRIMARY_IMAGE,
+                TARGET_MEGAPIXELS,
+            )
             staged.append(INPUT / primary_name)
-            second_name = _stage_image(SECOND_IMAGE, "reference") if SECOND_IMAGE else None
+
+            second_name = (
+                _stage_image(SECOND_IMAGE, "reference")
+                if SECOND_IMAGE
+                else None
+            )
             if second_name:
                 staged.append(INPUT / second_name)
+
             log("[generate] stage 4: build edit workflow")
             workflow = _edit_workflow(bool(second_name), resolved_base_model)
 
         if MODE == "text2image":
             log("[generate] stage 4: inject parameters and LoRAs")
-            _inject_t2i(workflow, prompt=PROMPT, width=width, height=height,
-                        steps=int(STEPS), cfg=float(CFG), sampler=SAMPLER,
-                        scheduler=SCHEDULER, seed=effective_seed,
-                        enabled_loras=enabled_loras)
+            _inject_t2i(
+                workflow,
+                prompt=PROMPT,
+                width=width,
+                height=height,
+                steps=int(STEPS),
+                cfg=float(CFG),
+                sampler=SAMPLER,
+                scheduler=SCHEDULER,
+                seed=effective_seed,
+                enabled_loras=enabled_loras,
+            )
         else:
             log("[generate] stage 5: inject parameters and LoRAs")
-            _inject_edit(workflow, primary_name=primary_name, second_name=second_name,
-                         width=width, height=height, edit_prompt=effective_edit_prompt,
-                         grounding_px=int(GROUNDING_PX), ref_boost=float(REF_BOOST),
-                         ref_boost_a=float(REF_BOOST_A), steps=int(STEPS), cfg=float(CFG),
-                         sampler=SAMPLER, scheduler=SCHEDULER, seed=effective_seed,
-                         enabled_loras=enabled_loras)
+            _inject_edit(
+                workflow,
+                primary_name=primary_name,
+                second_name=second_name,
+                width=width,
+                height=height,
+                edit_prompt=effective_edit_prompt,
+                grounding_px=int(GROUNDING_PX),
+                ref_boost=float(REF_BOOST),
+                ref_boost_a=float(REF_BOOST_A),
+                steps=int(STEPS),
+                cfg=float(CFG),
+                sampler=SAMPLER,
+                scheduler=SCHEDULER,
+                seed=effective_seed,
+                enabled_loras=enabled_loras,
+            )
 
-        active_loras = [{"hf_filename": f, "weight": float(w)} for f, w in enabled_loras]
+        active_loras = [
+            {"hf_filename": filename, "weight": float(weight)}
+            for filename, weight in enabled_loras
+        ]
+
         log("[generate] stage 6: build metadata")
         settings = build_settings(
-            mode=MODE, prompt=PROMPT, edit_prompt=effective_edit_prompt,
-            width=width, height=height, target_megapixels=float(TARGET_MEGAPIXELS),
-            grounding_px=int(GROUNDING_PX), ref_boost=float(REF_BOOST),
-            ref_boost_a=float(REF_BOOST_A), steps=int(STEPS), cfg=float(CFG),
-            sampler_name=SAMPLER, scheduler=SCHEDULER, seed=int(SEED),
-            randomize_seed=bool(RANDOMIZE_SEED), gen_budget=float(GEN_BUDGET),
-            effective_seed=effective_seed, base_model=BASE_MODEL,
-            custom_base_model=None, catalog_loras=active_loras, custom_loras=[])
+            mode=MODE,
+            prompt=PROMPT,
+            edit_prompt=effective_edit_prompt,
+            width=width,
+            height=height,
+            target_megapixels=float(TARGET_MEGAPIXELS),
+            grounding_px=int(GROUNDING_PX),
+            ref_boost=float(REF_BOOST),
+            ref_boost_a=float(REF_BOOST_A),
+            steps=int(STEPS),
+            cfg=float(CFG),
+            sampler_name=SAMPLER,
+            scheduler=SCHEDULER,
+            seed=int(SEED),
+            randomize_seed=bool(RANDOMIZE_SEED),
+            gen_budget=float(GEN_BUDGET),
+            effective_seed=effective_seed,
+            base_model=BASE_MODEL,
+            custom_base_model=None,
+            catalog_loras=active_loras,
+            custom_loras=[],
+        )
 
         log("[generate] stage 7: execute ComfyUI workflow")
         result_paths = _execute_workflow(workflow)
+
         log("[generate] stage 8: write metadata-preserving output")
         destination_dir = Path(tempfile.mkdtemp(prefix="krea2_outputs_"))
         output_paths: list[str] = []
+
         for index, source in enumerate(result_paths):
             destination = destination_dir / f"output_{index}.png"
             write_png_metadata(source, destination, settings)
             output_paths.append(str(destination))
             log("[output] %s", destination)
 
-        if not MEGA_ACCOUNT:
+        if MEGA_ACCOUNT is None:
             raise RuntimeError("MEGA account is not initialized")
+
         log("[generate] stage 9: upload to MEGA")
         for output_path in output_paths:
             _upload_to_mega(output_path, MEGA_ACCOUNT)
@@ -1113,57 +1162,216 @@ def run_cell_generation() -> tuple[list[str], int]:
         log("[generate] ===== SUCCESS in %.1fs =====", elapsed)
         log("[generate] used seed=%s", effective_seed)
         _memory_snapshot("generation-success")
+
         return output_paths, effective_seed
 
     except BaseException as exc:
         log_exception("generate", exc)
         _memory_snapshot("generation-error")
         raise
+
     finally:
         log("[generate] cleanup: %d staged file(s)", len(staged))
+
         for path in staged:
             try:
                 path.unlink(missing_ok=True)
             except Exception as exc:
-                log("[cleanup] failed removing %s: %s: %s", path, type(exc).__name__, exc)
+                log(
+                    "[cleanup] failed removing %s: %s: %s",
+                    path,
+                    type(exc).__name__,
+                    exc,
+                )
+
+        # This cleans temporary CUDA allocations but deliberately does NOT
+        # recreate or destroy the persistent ComfyUI runtime.
         _cleanup_memory("generation-finally")
+
         try:
             _GENERATION_LOCK.release()
             log("[generate] generation lock released")
         except RuntimeError:
             pass
+
         log("[generate] cleanup complete")
         log("=" * 80)
 
-def _on_startup() -> None:
-    global MEGA_ACCOUNT
-    log("=" * 80)
-    log("Krea 2 Turbo - Colab cell mode")
-    log("=" * 80)
-    log("[startup] ROOT: %s", ROOT)
-    log("[startup] COMFY: %s", COMFY)
-    log("[startup] MODELS: %s", MODELS)
-    _memory_snapshot("startup")
-    MEGA_ACCOUNT = _mega_login()
-    _ensure_comfy()
-    _scan_local_models()
-    _validate_required_assets()
-    _init_comfy_nodes()
-    log("[startup] persistent ComfyUI runtime ready")
-    _memory_snapshot("startup-ready")
 
+# ============================================================================
+# NOTEBOOK / PERSISTENT RUNTIME API
+# ============================================================================
+
+# This file is intentionally importable from Google Colab.
+#
+# Recommended notebook flow:
+#   Cell 1: scan model/LoRA files
+#   Cell 2: set generation variables
+#   Cell 3: import app_v2 and preload()
+#   Cell 4: generate_once(...), then display the returned image
+#
+# DO NOT run `!python app_v2.py` for every image.  That starts a new Python
+# process and loses the persistent ComfyUI runtime.
+
+DEFAULT_CONFIG = {
+    "MODE": "text2image",
+    "PROMPT": "A cinematic portrait in soft natural light",
+    "EDIT_PROMPT": "",
+    "PRIMARY_IMAGE": None,
+    "SECOND_IMAGE": None,
+    "WIDTH": 1024,
+    "HEIGHT": 1024,
+    "TARGET_MEGAPIXELS": 1.4,
+    "GROUNDING_PX": 768,
+    "REF_BOOST": 1.0,
+    "REF_BOOST_A": 1.0,
+    "STEPS": 8,
+    "CFG": 1.0,
+    "SAMPLER": "euler",
+    "SCHEDULER": "beta",
+    "SEED": 2,
+    "RANDOMIZE_SEED": False,
+    "GEN_BUDGET": 0,
+    "BASE_MODEL": "",
+    "LORA_WEIGHTS": {},
+}
+
+
+def _display_generated_image(path: str) -> None:
+    """Display an image when app_v2 is imported in a notebook."""
+    try:
+        from IPython.display import display
+        with Image.open(path) as image:
+            display(image.copy())
+    except Exception as exc:
+        log_exception("image-display", exc)
+        print(f"Generated image: {path}", flush=True)
+
+
+def preload() -> dict[str, Any]:
+    """Initialize ComfyUI/MEGA once and keep the runtime alive.
+
+    Call this ONCE in a Colab cell. Subsequent calls are harmless.
+    """
+    global MEGA_ACCOUNT
+
+    with _COMFY_RUNTIME_LOCK:
+        if MEGA_ACCOUNT is None:
+            log("[preload] logging into MEGA")
+            MEGA_ACCOUNT = _mega_login()
+        else:
+            log("[preload] MEGA already initialized")
+
+        log("[preload] ensuring ComfyUI")
+        _ensure_comfy()
+        _scan_local_models()
+        _validate_required_assets()
+
+        if not LOCAL_BASE_MODELS:
+            raise RuntimeError(
+                f"No diffusion models found in {DIFFUSION_DIR}"
+            )
+
+        log("[preload] initializing persistent ComfyUI runtime")
+        _init_comfy_nodes()
+
+        log("=" * 80)
+        log("[preload] READY — runtime will stay loaded in this notebook kernel")
+        log("[preload] base models: %d", len(LOCAL_BASE_MODELS))
+        log("[preload] LoRAs: %d", len(LOCAL_LORAS))
+        log("=" * 80)
+        _memory_snapshot("preload-ready")
+
+        return {
+            "comfy": str(COMFY),
+            "models": list(LOCAL_BASE_MODELS),
+            "loras": list(LOCAL_LORAS),
+            "ready": bool(_NODES_READY and _COMFY_EXECUTOR is not None),
+        }
+
+
+def _normalise_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    merged = dict(DEFAULT_CONFIG)
+    if config:
+        merged.update(config)
+
+    if not merged["BASE_MODEL"]:
+        if not LOCAL_BASE_MODELS:
+            raise RuntimeError("No base models are available")
+        merged["BASE_MODEL"] = LOCAL_BASE_MODELS[0]
+
+    return merged
+
+
+def generate_once(config: dict[str, Any] | None = None) -> tuple[list[str], int]:
+    """Generate one image using the already-preloaded runtime.
+
+    This is the function your Colab generation cells should call.
+    It does NOT recreate PromptServer, PromptExecutor, or ComfyUI nodes.
+    """
+    cfg = _normalise_config(config)
+
+    # Keep the existing generation implementation but feed it the current
+    # notebook settings.  The runtime objects themselves remain persistent.
+    global MODE, PROMPT, EDIT_PROMPT, PRIMARY_IMAGE, SECOND_IMAGE
+    global WIDTH, HEIGHT, TARGET_MEGAPIXELS, GROUNDING_PX
+    global REF_BOOST, REF_BOOST_A, STEPS, CFG, SAMPLER, SCHEDULER
+    global SEED, RANDOMIZE_SEED, GEN_BUDGET, BASE_MODEL, LORA_WEIGHTS
+
+    MODE = cfg["MODE"]
+    PROMPT = cfg["PROMPT"]
+    EDIT_PROMPT = cfg["EDIT_PROMPT"]
+    PRIMARY_IMAGE = cfg["PRIMARY_IMAGE"]
+    SECOND_IMAGE = cfg["SECOND_IMAGE"]
+    WIDTH = int(cfg["WIDTH"])
+    HEIGHT = int(cfg["HEIGHT"])
+    TARGET_MEGAPIXELS = float(cfg["TARGET_MEGAPIXELS"])
+    GROUNDING_PX = int(cfg["GROUNDING_PX"])
+    REF_BOOST = float(cfg["REF_BOOST"])
+    REF_BOOST_A = float(cfg["REF_BOOST_A"])
+    STEPS = int(cfg["STEPS"])
+    globals()["CFG"] = float(cfg["CFG"])
+    SAMPLER = cfg["SAMPLER"]
+    SCHEDULER = cfg["SCHEDULER"]
+    SEED = int(cfg["SEED"])
+    RANDOMIZE_SEED = bool(cfg["RANDOMIZE_SEED"])
+    GEN_BUDGET = float(cfg["GEN_BUDGET"])
+    BASE_MODEL = cfg["BASE_MODEL"]
+    LORA_WEIGHTS = dict(cfg.get("LORA_WEIGHTS") or {})
+
+    if not _NODES_READY or _COMFY_EXECUTOR is None:
+        log("[generate] runtime not ready; preloading now")
+        preload()
+
+    return run_cell_generation()
+
+
+def runtime_status() -> dict[str, Any]:
+    """Return a small status dictionary useful from Colab."""
+    return {
+        "comfy_ready": _COMFY_READY,
+        "nodes_ready": _NODES_READY,
+        "executor_ready": _COMFY_EXECUTOR is not None,
+        "mega_ready": MEGA_ACCOUNT is not None,
+        "base_models": list(LOCAL_BASE_MODELS),
+        "loras": list(LOCAL_LORAS),
+    }
+
+
+# Backwards-compatible standalone mode. This is useful for testing, but it is
+# NOT the recommended way to generate multiple images from Colab.
 if __name__ == "__main__":
     try:
-        _on_startup()
-        _scan_local_models()
-        outputs, used_seed = run_cell_generation()
         log("=" * 80)
-        log("[main] GENERATION SUCCESSFUL")
-        log("[main] used seed=%s", used_seed)
+        log("Krea 2 Turbo - standalone mode")
+        log("[warning] For repeated Colab generation, import app_v2 and use preload().")
+        log("=" * 80)
+        preload()
+        outputs, used_seed = generate_once()
+        log("[main] generation successful; seed=%s", used_seed)
         for output in outputs:
             log("[main] output=%s", output)
-            _open_generated_image(output)
-        log("=" * 80)
+            _display_generated_image(output)
     except BaseException as exc:
         log_exception("main", exc)
         _cleanup_memory("application-failure")
