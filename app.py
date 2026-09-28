@@ -676,7 +676,7 @@ def _edit_workflow(has_second_reference: bool, base_model: str) -> dict[str, Any
             "samples": _ref("13"), "vae": _ref("4")}},
         "15": {"class_type": "SaveImage", "inputs": {
             "images": _ref("14"), "filename_prefix": "krea2_edit"},
-    }
+    }}
 
     if has_second_reference:
         workflow["2"] = {"class_type": "LoadImage", "inputs": {"image": ""}}
